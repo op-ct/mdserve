@@ -35,9 +35,9 @@ WebSocket. This is the core interaction: an agent writes, a human reads.
 **Ephemeral sessions.** Start it during a coding session, kill it when you're
 done. mdserve is not a long-running server and doesn't need to be.
 
-**Agent-friendly content.** Full GFM support (tables, task lists, code blocks),
-Mermaid diagrams, and directory mode with sidebar navigation - the kinds of
-content AI coding agents actually produce.
+**Agent-friendly content.** Full GFM support (tables, task lists, code blocks,
+heading anchors), Mermaid diagrams, and directory mode with sidebar navigation -
+the kinds of content AI coding agents actually produce.
 
 ## What mdserve is not
 

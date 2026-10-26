@@ -166,8 +166,86 @@ impl MarkdownState {
         let html_body = markdown::to_html_with_options(content, &options)
             .unwrap_or_else(|_| "Error parsing markdown".to_string());
 
-        Ok(html_body)
+        Ok(add_heading_ids(&html_body))
     }
+}
+
+/// Adds GitHub-compatible `id` attributes to headings so that links like
+/// `[text](#some-heading)` jump to the right section. The markdown renderer
+/// emits headings as bare `<h1>`..`<h6>` tags, so only those are matched.
+fn add_heading_ids(html: &str) -> String {
+    let mut result = String::with_capacity(html.len());
+    let mut occurrences = HashMap::new();
+    let mut rest = html;
+
+    while let Some(start) = rest.find("<h") {
+        let tag = &rest[start..];
+        let level = match tag.as_bytes() {
+            [b'<', b'h', level @ b'1'..=b'6', b'>', ..] => *level as char,
+            _ => {
+                result.push_str(&rest[..start + 2]);
+                rest = &rest[start + 2..];
+                continue;
+            }
+        };
+        let Some(content_len) = tag[4..].find(&format!("</h{level}>")) else {
+            break;
+        };
+
+        let slug = unique_slug(&heading_slug(&tag[4..4 + content_len]), &mut occurrences);
+        result.push_str(&rest[..start]);
+        if slug.is_empty() {
+            result.push_str(&tag[..4]);
+        } else {
+            result.push_str(&format!("<h{level} id=\"{slug}\">"));
+        }
+        rest = &tag[4..];
+    }
+
+    result.push_str(rest);
+    result
+}
+
+/// Computes GitHub's anchor for a heading from its rendered HTML: the text
+/// content, lowercased, keeping only letters, numbers, `_`, `-` and spaces,
+/// with spaces replaced by `-`.
+fn heading_slug(inner_html: &str) -> String {
+    // Entities can be skipped rather than decoded: the renderer only emits
+    // &amp; &lt; &gt; &quot;, and the slug drops all of those characters.
+    let mut text = String::new();
+    let mut skip_until = None;
+    for c in inner_html.chars() {
+        match skip_until {
+            Some(end) if c == end => skip_until = None,
+            Some(_) => {}
+            None if c == '<' => skip_until = Some('>'),
+            None if c == '&' => skip_until = Some(';'),
+            None => text.push(c),
+        }
+    }
+
+    text.to_lowercase()
+        .chars()
+        .filter_map(|c| match c {
+            ' ' => Some('-'),
+            '-' | '_' => Some(c),
+            c if c.is_alphanumeric() => Some(c),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Deduplicates slugs the way GitHub does: the second "foo" becomes "foo-1",
+/// the third "foo-2", and so on.
+fn unique_slug(slug: &str, occurrences: &mut HashMap<String, usize>) -> String {
+    let mut result = slug.to_string();
+    while occurrences.contains_key(&result) {
+        let count = occurrences.entry(slug.to_string()).or_insert(0);
+        *count += 1;
+        result = format!("{slug}-{count}");
+    }
+    occurrences.insert(result.clone(), 0);
+    result
 }
 
 /// Handles a markdown file that may have been created or modified.
@@ -757,6 +835,51 @@ mod tests {
         assert_eq!(guess_image_content_type("test"), "application/octet-stream");
     }
 
+    fn heading_id(markdown: &str) -> String {
+        let html = MarkdownState::markdown_to_html(markdown).unwrap();
+        let start = html.find(" id=\"").expect("heading has no id") + 5;
+        let end = start + html[start..].find('"').unwrap();
+        html[start..end].to_string()
+    }
+
+    #[test]
+    fn test_heading_ids_match_github_slugs() {
+        assert_eq!(heading_id("# Hello World"), "hello-world");
+        assert_eq!(heading_id("## Hello, World!"), "hello-world");
+        assert_eq!(heading_id("## API & CLI"), "api--cli");
+        assert_eq!(heading_id("## The `render()` function"), "the-render-function");
+        assert_eq!(heading_id("## `Vec<T>` usage"), "vect-usage");
+        assert_eq!(heading_id("## **Bold** and _italic_"), "bold-and-italic");
+        assert_eq!(heading_id("## [Linked](https://example.com) text"), "linked-text");
+        assert_eq!(heading_id("## snake_case and kebab-case"), "snake_case-and-kebab-case");
+        assert_eq!(heading_id("## Ünïcödé Heading"), "ünïcödé-heading");
+        assert_eq!(heading_id("Setext Heading\n=============="), "setext-heading");
+    }
+
+    #[test]
+    fn test_heading_ids_are_deduplicated() {
+        let markdown = "# Foo\n\n## Foo\n\n### Foo\n\n## Foo 1\n\n## Foo-1";
+        let html = MarkdownState::markdown_to_html(markdown).unwrap();
+
+        assert!(html.contains(r#"<h1 id="foo">Foo</h1>"#));
+        assert!(html.contains(r#"<h2 id="foo-1">Foo</h2>"#));
+        assert!(html.contains(r#"<h3 id="foo-2">Foo</h3>"#));
+        assert!(html.contains(r#"<h2 id="foo-1-1">Foo 1</h2>"#));
+        assert!(html.contains(r#"<h2 id="foo-1-2">Foo-1</h2>"#));
+    }
+
+    #[test]
+    fn test_heading_without_slug_text_gets_no_id() {
+        let html = MarkdownState::markdown_to_html("## !!!").unwrap();
+        assert!(html.contains("<h2>!!!</h2>"));
+    }
+
+    #[test]
+    fn test_heading_tags_in_code_blocks_are_untouched() {
+        let html = MarkdownState::markdown_to_html("```html\n<h1>Title</h1>\n```").unwrap();
+        assert!(!html.contains(" id="));
+    }
+
     #[test]
     fn test_scan_markdown_files_empty_directory() {
         let temp_dir = tempdir().expect("Failed to create temp dir");
@@ -960,7 +1083,7 @@ mod tests {
         assert_eq!(response.status_code(), 200);
         let body = response.text();
 
-        assert!(body.contains("<h1>Hello World</h1>"));
+        assert!(body.contains(r#"<h1 id="hello-world">Hello World</h1>"#));
         assert!(body.contains("<strong>bold</strong>"));
         assert!(body.contains("theme-toggle"));
         assert!(body.contains("openThemeModal"));
@@ -1029,6 +1152,21 @@ fn main() {
         assert!(body.contains("<del>deleted text</del>"));
         assert!(body.contains("<pre>"));
         assert!(body.contains("fn main()"));
+    }
+
+    #[tokio::test]
+    async fn test_heading_anchor_links_resolve() {
+        let markdown_content = "# Guide\n\nSee [setup](#getting-started).\n\n## Getting Started\n";
+
+        let (server, _temp_file) = create_test_server(markdown_content).await;
+
+        let response = server.get("/").await;
+
+        assert_eq!(response.status_code(), 200);
+        let body = response.text();
+
+        assert!(body.contains(r##"<a href="#getting-started">setup</a>"##));
+        assert!(body.contains(r#"<h2 id="getting-started">Getting Started</h2>"#));
     }
 
     #[tokio::test]
@@ -1303,19 +1441,19 @@ classDiagram
         let response1 = server.get("/test1.md").await;
         assert_eq!(response1.status_code(), 200);
         let body1 = response1.text();
-        assert!(body1.contains("<h1>Test 1</h1>"));
+        assert!(body1.contains(r#"<h1 id="test-1">Test 1</h1>"#));
         assert!(body1.contains("Content of test1"));
 
         let response2 = server.get("/test2.markdown").await;
         assert_eq!(response2.status_code(), 200);
         let body2 = response2.text();
-        assert!(body2.contains("<h1>Test 2</h1>"));
+        assert!(body2.contains(r#"<h1 id="test-2">Test 2</h1>"#));
         assert!(body2.contains("Content of test2"));
 
         let response3 = server.get("/test3.md").await;
         assert_eq!(response3.status_code(), 200);
         let body3 = response3.text();
-        assert!(body3.contains("<h1>Test 3</h1>"));
+        assert!(body3.contains(r#"<h1 id="test-3">Test 3</h1>"#));
         assert!(body3.contains("Content of test3"));
     }
 
@@ -1457,7 +1595,7 @@ classDiagram
         let new_file_response = server.get("/test4.md").await;
         assert_eq!(new_file_response.status_code(), 200);
         let new_file_body = new_file_response.text();
-        assert!(new_file_body.contains("<h1>Test 4</h1>"));
+        assert!(new_file_body.contains(r#"<h1 id="test-4">Test 4</h1>"#));
         assert!(new_file_body.contains("This is a new file"));
     }
 
@@ -1592,7 +1730,7 @@ classDiagram
 
         assert!(!body.contains("title: Test Post"));
         assert!(!body.contains("author: Name"));
-        assert!(body.contains("<h1>Test Post</h1>"));
+        assert!(body.contains(r#"<h1 id="test-post">Test Post</h1>"#));
     }
 
     #[tokio::test]
@@ -1605,7 +1743,7 @@ classDiagram
         let body = response.text();
 
         assert!(!body.contains("title = \"Test Post\""));
-        assert!(body.contains("<h1>Test Post</h1>"));
+        assert!(body.contains(r#"<h1 id="test-post">Test Post</h1>"#));
     }
 
     #[tokio::test]
